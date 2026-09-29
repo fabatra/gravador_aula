@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gravador de Videoaula para YouTube</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #121212;
+      color: #ffffff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px;
+      margin: 0;
+    }
+    h1 { margin-bottom: 8px; }
+    p { color: #aaaaaa; margin-bottom: 24px; text-align: center; }
+    .controls { display: flex; gap: 16px; margin-bottom: 20px; }
+    button {
+      padding: 12px 24px;
+      font-size: 16px;
+      font-weight: bold;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background-color 0.2s, transform 0.1s;
+    }
+    button:active { transform: scale(0.98); }
+    #btnStart { background-color: #28a745; color: white; }
+    #btnStart:hover { background-color: #218838; }
+    #btnStop { background-color: #dc3545; color: white; }
+    #btnStop:hover { background-color: #c82333; }
+    button:disabled { background-color: #444444; color: #888888; cursor: not-allowed; }
+    .preview-container {
+      position: relative;
+      width: 100%;
+      max-width: 960px;
+      background-color: #000;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+    }
+    canvas { width: 100%; height: auto; display: block; }
+    video {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Gravador de Videoaula (Anti-Latência)</h1>
+  <p>Gravação fluida mesmo ao alternar abas no navegador.</p>
+
+  <div class="controls">
+    <button id="btnStart">🔴 Iniciar Gravação</button>
+    <button id="btnStop" disabled>⏹️ Parar e Baixar Vídeo</button>
+  </div>
+
+  <div class="preview-container">
+    <canvas id="recorderCanvas"></canvas>
+  </div>
+
+  <video id="screenVideo" autoplay playsinline muted></video>
+  <video id="webcamVideo" autoplay playsinline muted></video>
+
+  <script>
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+    const screenVideo = document.getElementById('screenVideo');
+    const webcamVideo = document.getElementById('webcamVideo');
+    const canvas = document.getElementById('recorderCanvas');
+    const ctx = canvas.getContext('2d');
+
+    let screenStream, webcamStream, mediaRecorder;
+    let recordedChunks = [];
+    let audioContext, audioDestination;
+    let timerWorker;
+
+    // Web Worker inline para manter 30 FPS cravados em segundo plano
+    const workerBlob = new Blob([`
+      let timerId;
+      self.onmessage = function(e) {
+        if (e.data === 'start') {
+          timerId = setInterval(() => { self.postMessage('tick'); }, 1000 / 30);
+        } else if (e.data === 'stop') {
+          clearInterval(timerId);
+        }
+      };
+    `], { type: 'text/javascript' });
+
+    btnStart.addEventListener('click', async () => {
+      try {
+        screenStream = await navigator.mediaDevices.getDisplayMedia({
+          video: { frameRate: 30 },
+          audio: true
+        });
+
+        webcamStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true
+        });
+
+        screenVideo.srcObject = screenStream;
+        webcamVideo.srcObject = webcamStream;
+
+        await screenVideo.play();
+        await webcamVideo.play();
+
+        canvas.width = screenVideo.videoWidth || 1920;
+        canvas.height = screenVideo.videoHeight || 1080;
+
+        // Audio Mixing
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        audioDestination = audioContext.createMediaStreamDestination();
+
+        if (screenStream.getAudioTracks().length > 0) {
+          const screenSource = audioContext.createMediaStreamSource(screenStream);
+          screenSource.connect(audioDestination);
+        }
+
+        if (webcamStream.getAudioTracks().length > 0) {
+          const webcamSource = audioContext.createMediaStreamSource(webcamStream);
+          webcamSource.connect(audioDestination);
+        }
+
+        // Render Loop acionado pelo Web Worker
+        function drawFrame() {
+          ctx.drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
+
+          if (webcamVideo.readyState >= 2 && webcamVideo.videoWidth > 0) {
+            const webcamWidth = canvas.width * 0.22;
+            const webcamHeight = (webcamWidth * webcamVideo.videoHeight) / webcamVideo.videoWidth;
+            const margin = 24;
+            const x = canvas.width - webcamWidth - margin;
+            const y = canvas.height - webcamHeight - margin;
+
+            ctx.save();
+            ctx.beginPath();
+            if (ctx.roundRect) {
+              ctx.roundRect(x, y, webcamWidth, webcamHeight, 12);
+            } else {
+              ctx.rect(x, y, webcamWidth, webcamHeight);
+            }
+            ctx.clip();
+            ctx.drawImage(webcamVideo, x, y, webcamWidth, webcamHeight);
+            ctx.restore();
+
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            if (ctx.roundRect) {
+              ctx.roundRect(x, y, webcamWidth, webcamHeight, 12);
+            } else {
+              ctx.rect(x, y, webcamWidth, webcamHeight);
+            }
+            ctx.stroke();
+          }
+        }
+
+        // Inicia o Web Worker
+        timerWorker = new Worker(URL.createObjectURL(workerBlob));
+        timerWorker.onmessage = drawFrame;
+        timerWorker.postMessage('start');
+
+        const canvasStream = canvas.captureStream(30);
+        const combinedStream = new MediaStream([
+          ...canvasStream.getVideoTracks(),
+          ...audioDestination.stream.getAudioTracks()
+        ]);
+
+        mediaRecorder = new MediaRecorder(combinedStream, {
+          mimeType: MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+            ? 'video/webm;codecs=vp9'
+            : 'video/webm'
+        });
+
+        recordedChunks = [];
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) recordedChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = exportVideo;
+        mediaRecorder.start();
+
+        btnStart.disabled = true;
+        btnStop.disabled = false;
+
+        screenStream.getVideoTracks().onended = stopRecording;
+
+      } catch (err) {
+        console.error("Erro ao iniciar a gravação:", err);
+        alert("Erro ao acessar permissões de câmera ou tela.");
+      }
+    });
+
+    btnStop.addEventListener('click', stopRecording);
+
+    function stopRecording() {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+      }
+      if (timerWorker) {
+        timerWorker.postMessage('stop');
+        timerWorker.terminate();
+      }
+
+      if (screenStream) screenStream.getTracks().forEach(t => t.stop());
+      if (webcamStream) webcamStream.getTracks().forEach(t => t.stop());
+
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+    }
+
+    function exportVideo() {
+      const blob = new Blob(recordedChunks, { type: 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `videoaula_${new Date().toISOString().slice(0,10)}.webm`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  </script>
+</body>
+</html>
